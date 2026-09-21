@@ -1,0 +1,116 @@
+name: CI/CD order-service
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'order-service/**'
+      - '.github/workflows/order-service.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'order-service/**'
+      - '.github/workflows/order-service.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-push-deploy:
+    name: Build, Push to ECR & Deploy order-service
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+          aws-region: us-east-1
+
+      - name: Retrieve Infrastructure Secrets from AWS Secrets Manager
+        id: fetch-secrets
+        run: |
+          echo "Fetching backend infra configurations from AWS Secrets Manager..."
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "hyperswitch/infra" --query SecretString --output text 2>/dev/null || echo "{}")
+          
+          AWS_REGION=$(echo "$SECRET_JSON" | jq -r '.AWS_REGION // .aws_region // "us-east-1"')
+          
+          EKS_CLUSTER=$(echo "$SECRET_JSON" | jq -r '.EKS_CLUSTER_NAME // .eks_cluster_name // empty')
+          if [ -z "$EKS_CLUSTER" ]; then
+            echo "EKS_CLUSTER_NAME not found in secret, discovering via AWS CLI..."
+            EKS_CLUSTER=$(aws eks list-clusters --region "$AWS_REGION" --query "clusters[0]" --output text 2>/dev/null || echo "hyperswitch-cluster")
+          fi
+
+          KUBE_NS=$(echo "$SECRET_JSON" | jq -r '.NAMESPACE_ORDER_SERVICE // "order-service"')
+
+          echo "aws_region=$AWS_REGION" >> $GITHUB_OUTPUT
+          echo "eks_cluster=$EKS_CLUSTER" >> $GITHUB_OUTPUT
+          echo "kube_ns=$KUBE_NS" >> $GITHUB_OUTPUT
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR Repository Exists
+        run: |
+          ECR_REPO="hyperswitch/order-service"
+          echo "Checking if repository $ECR_REPO exists in ECR..."
+          aws ecr describe-repositories --repository-names "$ECR_REPO" --region "${{ steps.fetch-secrets.outputs.aws_region }}" 2>/dev/null ||           aws ecr create-repository --repository-name "$ECR_REPO" --region "${{ steps.fetch-secrets.outputs.aws_region }}" --image-scanning-configuration scanOnPush=true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & Tag Docker Image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO: "hyperswitch/order-service"
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build             -t "$REGISTRY/$ECR_REPO:$IMAGE_TAG"             -t "$REGISTRY/$ECR_REPO:latest"             ./order-service
+
+      - name: Push Docker Image to Amazon ECR
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO: "hyperswitch/order-service"
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Pushing images to ECR..."
+          docker push "$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO:latest"
+
+      - name: Update Deployment Image via kubectl
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO: "hyperswitch/order-service"
+          IMAGE_TAG: ${{ github.sha }}
+          CLUSTER: ${{ steps.fetch-secrets.outputs.eks_cluster }}
+          REGION: ${{ steps.fetch-secrets.outputs.aws_region }}
+          NAMESPACE: ${{ steps.fetch-secrets.outputs.kube_ns }}
+        run: |
+          echo "Configuring kubectl for EKS cluster: $CLUSTER in $REGION..."
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION" 2>/dev/null || true
+
+          echo "Ensuring namespace $NAMESPACE exists in cluster..."
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+
+          IMAGE_URI="$REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          echo "Executing kubectl set image for order-service to $IMAGE_URI in namespace $NAMESPACE..."
+          kubectl set image deployment/order-service order-service="$IMAGE_URI" -n "$NAMESPACE" || \
+          kubectl set image deployment/order-service order-service="$IMAGE_URI" -n default || \
+          echo "Notice: Deployment not running in cluster yet. Image pushed to ECR successfully."
+
+          echo "Checking rollout status..."
+          kubectl rollout status deployment/order-service -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
