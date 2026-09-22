@@ -114,3 +114,6 @@ jobs:
 
           echo "Checking rollout status..."
           kubectl rollout status deployment/inventory-service -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
+
+
+
